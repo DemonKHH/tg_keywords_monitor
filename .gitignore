@@ -1,0 +1,4 @@
+dist
+build
+*.spec
+download_files
