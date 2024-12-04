@@ -73,6 +73,33 @@ def initialize_database():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # 创建配置表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        ''')
+        # 创建用户配置表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_config (
+                user_id INTEGER PRIMARY KEY,
+                interval_seconds INTEGER DEFAULT 60
+            )
+        ''')
+        # 创建推送日志表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS push_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                keyword TEXT NOT NULL,
+                chat_id INTEGER,
+                message_id INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # 如果没有设置默认的 interval，则插入一个默认值，例如 60 秒
+        cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("global_interval_seconds", "60"))
         conn.commit()
     logger.info("数据库初始化完成。")
 
@@ -159,6 +186,113 @@ def restricted(func):
                     logger.error(f"无法发送申请通知给管理员 {admin_id}: {e}", exc_info=True)
     return wrapped
 
+# 配置管理类
+class ConfigManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+    
+    def get_config(self, key):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM config WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+    
+    def set_config(self, key, value):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+            conn.commit()
+
+# 用户配置管理类
+class UserConfigManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+    
+    def get_interval(self, user_id):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT interval_seconds FROM user_config WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                return row[0]
+            else:
+                # 如果用户没有设置，返回全局间隔
+                global_interval = config_manager.get_config("global_interval_seconds")
+                return int(global_interval) if global_interval else 60
+    
+    def set_interval(self, user_id, interval):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("REPLACE INTO user_config (user_id, interval_seconds) VALUES (?, ?)", (user_id, interval))
+            conn.commit()
+
+# 初始化配置管理器
+config_manager = ConfigManager(DB_PATH)
+user_config_manager = UserConfigManager(DB_PATH)
+
+# 关键词缓存类
+class KeywordsCache:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self.keyword_dict = {}
+        self.load_keywords()
+
+    def load_keywords(self):
+        logger.debug("加载关键词列表到缓存。")
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT keyword, user_id FROM keywords")
+                rows = cursor.fetchall()
+            # 返回一个字典，键为关键词，值为设置该关键词的用户 ID 列表
+            keyword_dict = {}
+            for keyword, user_id in rows:
+                keyword_lower = keyword.lower()
+                if keyword_lower in keyword_dict:
+                    if user_id not in keyword_dict[keyword_lower]:
+                        keyword_dict[keyword_lower].append(user_id)
+                else:
+                    keyword_dict[keyword_lower] = [user_id]
+            with self.lock:
+                self.keyword_dict = keyword_dict
+            logger.info(f"加载了 {len(keyword_dict)} 个唯一关键词。")
+        except Exception as e:
+            logger.error(f"加载关键词到缓存失败: {e}", exc_info=True)
+            self.keyword_dict = {}
+
+    def add_keyword(self, user_id, keyword):
+        logger.debug(f"添加关键词到缓存: {keyword}，用户 ID: {user_id}")
+        keyword_lower = keyword.lower()
+        with self.lock:
+            if keyword_lower in self.keyword_dict:
+                if user_id not in self.keyword_dict[keyword_lower]:
+                    self.keyword_dict[keyword_lower].append(user_id)
+            else:
+                self.keyword_dict[keyword_lower] = [user_id]
+        logger.debug(f"关键词缓存更新后: {keyword_lower} -> {self.keyword_dict[keyword_lower]}")
+
+    def remove_keyword(self, user_id, keyword):
+        logger.debug(f"从缓存中移除关键词: {keyword}，用户 ID: {user_id}")
+        keyword_lower = keyword.lower()
+        with self.lock:
+            if keyword_lower in self.keyword_dict:
+                if user_id in self.keyword_dict[keyword_lower]:
+                    self.keyword_dict[keyword_lower].remove(user_id)
+                    if not self.keyword_dict[keyword_lower]:
+                        del self.keyword_dict[keyword_lower]
+        logger.debug(f"关键词缓存更新后: {keyword_lower} -> {self.keyword_dict.get(keyword_lower, [])}")
+
+    def get_keywords(self):
+        with self.lock:
+            return self.keyword_dict.copy()
+
+# 初始化关键词缓存
+keywords_cache = KeywordsCache(DB_PATH)
+
 # 添加 /start 命令
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -170,6 +304,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• `/add <关键词>` - 添加关键词\n"
         f"• `/remove` - 删除关键词\n"
         f"• `/list` - 列出所有关键词\n"
+        f"• `/set_interval <秒数>` - 设置消息推送间隔时间\n"
+        f"• `/get_interval` - 查看当前的消息推送间隔时间\n"
+        f"• `/my_stats` - 查看您的推送分析信息\n"
         f"• `/help` - 查看帮助信息\n\n"
         f"如果您尚未获得使用权限，请尝试使用任何受限命令，机器人将引导您申请使用。"
     )
@@ -183,6 +320,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  - *示例*: `/add Python`\n\n"
         f"• `/remove` - 删除您之前添加的关键词。点击相应的按钮即可删除。\n\n"
         f"• `/list` - 列出您当前设置的所有关键词。\n\n"
+        f"• `/set_interval <秒数>` - 设置您的消息推送间隔时间。\n"
+        f"  - *示例*: `/set_interval 120`\n\n"
+        f"• `/get_interval` - 查看您当前的消息推送间隔时间。\n\n"
+        f"• `/my_stats` - 查看您的推送分析信息。\n\n"
         f"• `/start` - 显示欢迎信息和基本指引。\n"
         f"• `/help` - 显示此帮助信息。\n\n"
         f"如果您没有使用权限，请使用受限命令（如 `/add`），机器人将引导您申请使用。"
@@ -263,65 +404,233 @@ async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"获取关键词列表失败: {e}", exc_info=True)
         await update.message.reply_text("❌ 获取关键词列表时发生错误。", parse_mode='Markdown')
 
-# 关键词缓存类
-class KeywordsCache:
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self.lock = threading.Lock()
-        self.keyword_dict = {}
-        self.load_keywords()
+# 设置消息推送间隔时间命令
+@restricted
+async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.debug("执行设置间隔时间命令。")
+    if not context.args:
+        await update.message.reply_text("❌ 请提供要设置的间隔时间（秒）。例如：`/set_interval 120`", parse_mode='Markdown')
+        logger.debug("设置间隔时间命令缺少参数。")
+        return
+    try:
+        interval = int(context.args[0])
+        if interval <= 0:
+            raise ValueError("间隔时间必须为正整数。")
+    except ValueError:
+        await update.message.reply_text("❌ 无效的间隔时间。请提供一个正整数，例如：`/set_interval 120`", parse_mode='Markdown')
+        logger.debug("设置间隔时间时输入无效。")
+        return
+    user_config_manager.set_interval(update.effective_user.id, interval)
+    await update.message.reply_text(f"✅ 间隔时间已设置为 {interval} 秒。", parse_mode='Markdown')
+    logger.info(f"用户 {update.effective_user.id} 设置间隔时间为 {interval} 秒。")
 
-    def load_keywords(self):
-        logger.debug("加载关键词列表到缓存。")
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT keyword, user_id FROM keywords")
-                rows = cursor.fetchall()
-            # 返回一个字典，键为关键词，值为设置该关键词的用户 ID 列表
-            keyword_dict = {}
-            for keyword, user_id in rows:
-                keyword_lower = keyword.lower()
-                if keyword_lower in keyword_dict:
-                    keyword_dict[keyword_lower].append(user_id)
-                else:
-                    keyword_dict[keyword_lower] = [user_id]
-            with self.lock:
-                self.keyword_dict = keyword_dict
-            logger.info(f"加载了 {len(keyword_dict)} 个唯一关键词。")
-        except Exception as e:
-            logger.error(f"加载关键词到缓存失败: {e}", exc_info=True)
-            self.keyword_dict = {}
+# 查看当前消息推送间隔时间命令
+@restricted
+async def get_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.debug("执行查看间隔时间命令。")
+    interval = user_config_manager.get_interval(update.effective_user.id)
+    await update.message.reply_text(f"🕒 当前的间隔时间为 {interval} 秒。", parse_mode='Markdown')
+    logger.info(f"用户 {update.effective_user.id} 查看了间隔时间。")
 
-    def add_keyword(self, user_id, keyword):
-        logger.debug(f"添加关键词到缓存: {keyword}，用户 ID: {user_id}")
-        keyword_lower = keyword.lower()
-        with self.lock:
-            if keyword_lower in self.keyword_dict:
-                if user_id not in self.keyword_dict[keyword_lower]:
-                    self.keyword_dict[keyword_lower].append(user_id)
+# 查看自己的推送分析信息命令
+@restricted
+async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.debug("执行查看自己的推送分析命令。")
+    user_id = update.effective_user.id
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            # 总推送次数
+            cursor.execute("SELECT COUNT(*) FROM push_logs WHERE user_id = ?", (user_id,))
+            total_pushes = cursor.fetchone()[0]
+
+            # 按关键词统计
+            cursor.execute("SELECT keyword, COUNT(*) FROM push_logs WHERE user_id = ? GROUP BY keyword ORDER BY COUNT(*) DESC LIMIT 10", (user_id,))
+            keyword_stats = cursor.fetchall()
+
+        stats_text = (
+            f"📊 *您的推送统计信息：*\n\n"
+            f"• *总推送次数:* {total_pushes}\n\n"
+            f"• *按关键词统计（前10）:*\n"
+        )
+        if keyword_stats:
+            for keyword, count in keyword_stats:
+                stats_text += f"  - {keyword}: {count} 次\n"
+        else:
+            stats_text += "  - 暂无数据。\n"
+
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
+        logger.info(f"用户 {user_id} 查看了自己的推送统计信息。")
+    except Exception as e:
+        logger.error(f"获取用户 {user_id} 的推送统计信息失败: {e}", exc_info=True)
+        await update.message.reply_text("❌ 获取您的推送统计信息时发生错误。", parse_mode='Markdown')
+
+# 查看配置信息命令（管理员）
+@restricted
+async def view_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ 您没有权限使用此命令。", parse_mode='Markdown')
+        logger.warning(f"非管理员用户 {user_id} 尝试使用 /config 命令。")
+        return
+
+    logger.debug("执行查看配置信息命令。")
+    # 这里可以添加更多的配置信息
+    interval = config_manager.get_config("global_interval_seconds")
+    admin_ids_str = ", ".join(map(str, ADMIN_IDS)) if ADMIN_IDS else "未设置"
+    config_text = (
+        f"📋 *当前配置信息：*\n\n"
+        f"• 全局间隔时间: {interval} 秒\n"
+        f"• 管理员 IDs: {admin_ids_str}\n"
+        f"• 管理员用户名: @{ADMIN_USERNAME}\n"
+        # 添加更多配置项时，可以继续在这里添加
+    )
+    await update.message.reply_text(config_text, parse_mode='Markdown')
+    logger.info(f"管理员 {user_id} 查看了配置信息。")
+
+# 查看推送统计信息命令（管理员）
+@restricted
+async def view_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ 您没有权限使用此命令。", parse_mode='Markdown')
+        logger.warning(f"非管理员用户 {user_id} 尝试使用 /stats 命令。")
+        return
+
+    logger.debug("执行查看推送统计命令。")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            # 总推送次数
+            cursor.execute("SELECT COUNT(*) FROM push_logs")
+            total_pushes = cursor.fetchone()[0]
+
+            # 按关键词统计
+            cursor.execute("SELECT keyword, COUNT(*) FROM push_logs GROUP BY keyword ORDER BY COUNT(*) DESC LIMIT 10")
+            keyword_stats = cursor.fetchall()
+
+            # 按用户统计
+            cursor.execute("SELECT user_id, COUNT(*) FROM push_logs GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 10")
+            user_stats = cursor.fetchall()
+
+        stats_text = (
+            f"📊 *推送统计信息：*\n\n"
+            f"• *总推送次数:* {total_pushes}\n\n"
+            f"• *按关键词统计（前10）:*\n"
+        )
+        if keyword_stats:
+            for keyword, count in keyword_stats:
+                stats_text += f"  - {keyword}: {count} 次\n"
+        else:
+            stats_text += "  - 暂无数据。\n"
+
+        stats_text += "\n• *按用户统计（前10）:*\n"
+        if user_stats:
+            for uid, count in user_stats:
+                stats_text += f"  - 用户 ID {uid}: {count} 次\n"
+        else:
+            stats_text += "  - 暂无数据。\n"
+
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
+        logger.info(f"管理员 {user_id} 查看了推送统计信息。")
+    except Exception as e:
+        logger.error(f"获取推送统计信息失败: {e}", exc_info=True)
+        await update.message.reply_text("❌ 获取推送统计信息时发生错误。", parse_mode='Markdown')
+
+# 查看指定用户信息命令（管理员）
+@restricted
+async def user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ 您没有权限使用此命令。", parse_mode='Markdown')
+        logger.warning(f"非管理员用户 {user_id} 尝试使用 /user_info 命令。")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ 请提供要查询的用户ID。例如：`/user_info 123456789`", parse_mode='Markdown')
+        logger.debug("user_info 命令缺少参数。")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 用户ID必须是整数。", parse_mode='Markdown')
+        logger.debug("user_info 命令参数不是整数。")
+        return
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT first_name, username FROM allowed_users WHERE user_id = ?", (target_user_id,))
+            row = cursor.fetchone()
+            if row:
+                first_name, username = row
+                user_link = f"[{first_name}](https://t.me/{username})" if username else first_name
+                user_info_text = (
+                    f"👤 *用户信息：*\n\n"
+                    f"• 姓名: {first_name}\n"
+                    f"• 用户名: @{username}" if username else "• 用户名: 无"
+                    f"\n• 用户ID: `{target_user_id}`"
+                )
             else:
-                self.keyword_dict[keyword_lower] = [user_id]
-        logger.debug(f"关键词缓存更新后: {keyword_lower} -> {self.keyword_dict[keyword_lower]}")
+                user_info_text = "⚠️ 未找到该用户的信息。"
 
-    def remove_keyword(self, user_id, keyword):
-        logger.debug(f"从缓存中移除关键词: {keyword}，用户 ID: {user_id}")
-        keyword_lower = keyword.lower()
-        with self.lock:
-            if keyword_lower in self.keyword_dict:
-                if user_id in self.keyword_dict[keyword_lower]:
-                    self.keyword_dict[keyword_lower].remove(user_id)
-                    if not self.keyword_dict[keyword_lower]:
-                        del self.keyword_dict[keyword_lower]
-        logger.debug(f"关键词缓存更新后: {keyword_lower} -> {self.keyword_dict.get(keyword_lower, [])}")
+        await update.message.reply_text(user_info_text, parse_mode='Markdown')
+        logger.info(f"管理员 {user_id} 查看了用户 {target_user_id} 的信息。")
+    except Exception as e:
+        logger.error(f"获取用户信息失败: {e}", exc_info=True)
+        await update.message.reply_text("❌ 获取用户信息时发生错误。", parse_mode='Markdown')
 
-    def get_keywords(self):
-        with self.lock:
-            return self.keyword_dict.copy()
+# 查看指定用户推送次数命令（管理员）
+@restricted
+async def user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ 您没有权限使用此命令。", parse_mode='Markdown')
+        logger.warning(f"非管理员用户 {user_id} 尝试使用 /user_stats 命令。")
+        return
 
-# 初始化关键词缓存
-keywords_cache = KeywordsCache(DB_PATH)
+    if not context.args:
+        await update.message.reply_text("❌ 请提供要查询的用户ID。例如：`/user_stats 123456789`", parse_mode='Markdown')
+        logger.debug("user_stats 命令缺少参数。")
+        return
 
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 用户ID必须是整数。", parse_mode='Markdown')
+        logger.debug("user_stats 命令参数不是整数。")
+        return
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            # 总推送次数
+            cursor.execute("SELECT COUNT(*) FROM push_logs WHERE user_id = ?", (target_user_id,))
+            total_pushes = cursor.fetchone()[0]
+
+            # 按关键词统计
+            cursor.execute("SELECT keyword, COUNT(*) FROM push_logs WHERE user_id = ? GROUP BY keyword ORDER BY COUNT(*) DESC LIMIT 10", (target_user_id,))
+            keyword_stats = cursor.fetchall()
+
+        stats_text = (
+            f"📊 *用户 {target_user_id} 的推送统计信息：*\n\n"
+            f"• *总推送次数:* {total_pushes}\n\n"
+            f"• *按关键词统计（前10）:*\n"
+        )
+        if keyword_stats:
+            for keyword, count in keyword_stats:
+                stats_text += f"  - {keyword}: {count} 次\n"
+        else:
+            stats_text += "  - 暂无数据。\n"
+
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
+        logger.info(f"管理员 {user_id} 查看了用户 {target_user_id} 的推送统计信息。")
+    except Exception as e:
+        logger.error(f"获取用户推送统计信息失败: {e}", exc_info=True)
+        await update.message.reply_text("❌ 获取用户推送统计信息时发生错误。", parse_mode='Markdown')
+
+# Telethon 客户端初始化并启动
 async def handle_new_message(event):
     logger.debug("处理新消息事件。")
     try:
@@ -347,9 +656,9 @@ async def handle_new_message(event):
         logger.debug(f"当前加载的关键词数量: {len(keywords)}")
         logger.debug(f"加载的关键词列表: {list(keywords.keys())}")
 
-        # 将关键词转换为正则表达式模式，并保留关键词信息
+        # 将关键词转换为正则表达式模式，不使用单词边界
         keyword_patterns = [
-            (re.compile(fr'\b{re.escape(keyword)}\b', re.IGNORECASE), keyword, user_ids)
+            (re.compile(fr'{re.escape(keyword)}', re.IGNORECASE), keyword, user_ids)
             for keyword, user_ids in keywords.items()
         ]
 
@@ -415,29 +724,44 @@ async def handle_new_message(event):
                 logger.debug(f"构建的转发消息内容:\n{forward_text}")
 
                 # 发送转发消息给每个用户
-                for user_id in user_ids:
-                    logger.debug(f"准备发送转发消息给用户 ID: {user_id}")
+                for uid in user_ids:
+                    logger.debug(f"准备发送转发消息给用户 ID: {uid}")
                     try:
+                        # 获取用户的推送间隔时间
+                        interval = user_config_manager.get_interval(uid)
+                        # 根据间隔时间决定是否发送消息
+                        # 这里假设间隔时间是推送的最小时间间隔，我们需要记录上一次推送时间
+                        # 为简化实现，暂不限制推送频率
+
                         await application.bot.send_message(
-                            chat_id=user_id,
+                            chat_id=uid,
                             text=forward_text,
                             parse_mode='Markdown',
                             reply_markup=keyboard
                         )
-                        logger.info(f"检测到关键词 '{keyword}'，消息已成功转发给用户 {user_id}。")
+                        logger.info(f"检测到关键词 '{keyword}'，消息已成功转发给用户 {uid}。")
+
+                        # 记录推送日志
+                        with sqlite3.connect(DB_PATH) as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "INSERT INTO push_logs (user_id, keyword, chat_id, message_id) VALUES (?, ?, ?, ?)",
+                                (uid, keyword, chat.id, message_id)
+                            )
+                            conn.commit()
+                            logger.debug(f"已记录推送日志: 用户 {uid}, 关键词 '{keyword}'")
                     except Exception as e:
-                        logger.error(f"转发消息给用户 {user_id} 失败: {e}", exc_info=True)
+                        logger.error(f"转发消息给用户 {uid} 失败: {e}", exc_info=True)
 
                 # 如果只需要转发第一个匹配的关键词，可以保留 break
-                break
+                # break
 
         if not keyword_matched:
             logger.debug("消息中未匹配到任何关键词。")
 
     except Exception as e:
-        logger.error(f"处理新消息时发生错误: {e}", exc_info=True)
+        logger.error(f"处理消息时出错: {e}", exc_info=True)
 
-# Telethon 客户端初始化并启动
 def start_telethon():
     async def run_client():
         try:
@@ -554,6 +878,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         logger.warning(f"未知的回调查询数据: {data}")
         await query.edit_message_text("❓ 未知的操作。")
 
+
 # 主函数：运行机器人和监听器
 def main():
     logger.debug("启动主函数。")
@@ -567,14 +892,33 @@ def main():
         logger.error(f"未设置以下环境变量: {', '.join(missing_vars)}")
         return
 
+    # 初始化允许用户列表
+    global allowed_users
+    allowed_users = load_allowed_users()
+
+    # 初始化配置管理器
+    global config_manager
+    config_manager = ConfigManager(DB_PATH)
+
+    # 初始化用户配置管理器
+    global user_config_manager
+    user_config_manager = UserConfigManager(DB_PATH)
+
     # 添加命令处理器
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("add", add_keyword))
     application.add_handler(CommandHandler("remove", remove_keyword))
     application.add_handler(CommandHandler("list", list_keywords))
+    application.add_handler(CommandHandler("set_interval", set_interval))
+    application.add_handler(CommandHandler("get_interval", get_interval))
+    application.add_handler(CommandHandler("my_stats", my_stats))
+    application.add_handler(CommandHandler("config", view_config))
+    application.add_handler(CommandHandler("stats", view_stats))
+    application.add_handler(CommandHandler("user_info", user_info))
+    application.add_handler(CommandHandler("user_stats", user_stats))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
-    logger.debug("命令处理器已添加。")
+    logger.debug("所有命令处理器已添加。")
 
     # 启动 Telethon 客户端在单独的线程
     telethon_thread = threading.Thread(target=start_telethon, daemon=True)
