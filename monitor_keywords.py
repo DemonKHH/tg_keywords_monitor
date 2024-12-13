@@ -5,7 +5,7 @@ import sqlite3
 import asyncio
 from logging.handlers import RotatingFileHandler
 import uuid
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telethon.tl.functions.auth import SendCodeRequest, SignInRequest
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import (
@@ -551,7 +551,7 @@ class DatabaseManager:
 
 # 主机器人类
 class TelegramBot:
-    def __init__(self, token, admin_ids, admin_username, api_id, api_hash,  db_path='bot.db'):
+    def __init__(self, token, admin_ids, admin_username, api_id, api_hash, db_path='bot.db'):
         self.token = token
         self.admin_ids = admin_ids
         self.admin_username = admin_username
@@ -563,6 +563,26 @@ class TelegramBot:
         self.application = Application.builder().token(self.token).build()
         self.user_clients = {}  # key: account_id, value: TelegramClient
         self.setup_handlers()
+        
+        # 设置底部命令菜单
+        self.commands = [
+            BotCommand("start", "启动机器人"),
+            BotCommand("help", "帮助信息"),
+            BotCommand("login", "登录账号"),
+            BotCommand("list_accounts", "账号列表"),
+            BotCommand("add_keyword", "添加关键词"),
+            BotCommand("remove_keyword", "删除关键词"),
+            BotCommand("list_keywords", "关键词列表"),
+            BotCommand("block", "屏蔽用户"),
+            BotCommand("unblock", "解除屏蔽"),
+            BotCommand("list_blocked_users", "屏蔽列表"),
+            BotCommand("my_stats", "数据统计")
+        ]
+        
+        # 在 setup_handlers 后设置命令菜单
+        asyncio.get_event_loop().run_until_complete(
+            self.application.bot.set_my_commands(self.commands)
+        )
 
     def setup_handlers(self):
         # 添加命令处理器
@@ -1062,47 +1082,6 @@ class TelegramBot:
             await query.edit_message_text(
                 f"❌ 已拒绝用户的访问请求。"
             )
-
-        # elif data.startswith("remove_group:"):
-        #     parts = data.split(":")
-        #     if len(parts) != 3:
-        #         logger.warning(f"无效的 remove_group 回调数据: {data}")
-        #         await query.edit_message_text("❓ 无效的操作。")
-        #         return
-
-        #     group_id = int(parts[1])
-        #     user_id = int(parts[2])
-
-        #     # 获取群组名称
-        #     with sqlite3.connect(self.db_path) as conn:
-        #         cursor = conn.cursor()
-        #         cursor.execute("SELECT group_name FROM groups WHERE group_id = ?", (group_id,))
-        #         row = cursor.fetchone()
-        #         group_name = row[0] if row else "未知群组"
-
-        #     # 从用户监听列表中移除群组
-        #     try:
-        #         self.db_manager.remove_group(user_id, group_id)
-        #         await query.edit_message_text(
-        #             f"✅ 群组 `{group_id}` - *{group_name}* 已从您的监听列表中移除。",
-        #             parse_mode='Markdown'
-        #         )
-        #         logger.info(f"用户 {user_id} 移除了群组 {group_id} - {group_name} 从自己的监听列表。")
-
-        #         # 取消监听该群组的消息
-        #         accounts = self.db_manager.get_user_accounts(user_id)
-        #         for account in accounts:
-        #             account_id = account[0]
-        #             client = self.user_clients.get(account_id)
-        #             if client:
-        #                 client.remove_event_handler(self.handle_new_message, events.NewMessage(chats=group_id))
-        #                 logger.info(f"账号 {account_id} 停止监听群组 {group_id}。")
-        #     except Exception as e:
-        #         await query.edit_message_text(
-        #             f"❌ 无法移除群组。\n错误详情: {e}",
-        #             parse_mode='Markdown'
-        #         )
-        #         logger.error(f"移除群组 {group_id} 失败: {e}", exc_info=True)
 
         elif data.startswith("block_user:"):
             parts = data.split(":")
