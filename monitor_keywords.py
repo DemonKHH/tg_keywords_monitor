@@ -32,7 +32,7 @@ from telegram.helpers import escape_markdown
 from telethon import TelegramClient, events, errors
 from dotenv import load_dotenv
 import stat
-
+from datetime import datetime
 # 加载环境变量
 load_dotenv()
 
@@ -101,24 +101,6 @@ class DatabaseManager:
         logger.debug("初始化数据库连接。")
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # 创建允许用户表
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS allowed_users (
-                    user_id INTEGER PRIMARY KEY,
-                    first_name TEXT,
-                    username TEXT
-                )
-            ''')
-            # 创建申请表
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pending_applications (
-                    application_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL UNIQUE,
-                    first_name TEXT,
-                    username TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
             # 创建配置表
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS config (
@@ -200,28 +182,7 @@ class DatabaseManager:
             cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("global_interval_seconds", "60"))
 
             conn.commit()
-        logger.info("数据库初始化完成。")
-        
-    # 添加授权用户的方法
-    def add_allowed_user(self, user_id, first_name, username):
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO allowed_users (user_id, first_name, username) VALUES (?, ?, ?)", (user_id, first_name, username))
-                conn.commit()
-            logger.info(f"用户 {user_id} ({first_name}, @{username}) 已被授权。")
-        except sqlite3.IntegrityError:
-            logger.warning(f"用户 {user_id} ({first_name}, @{username}) 已经被授权。")
-        except Exception as e:
-            logger.error(f"添加授权用户失败: {e}", exc_info=True)       
-
-    # 获取已授权的用户列表
-    def get_allowed_users(self):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, first_name, username FROM allowed_users")
-            rows = cursor.fetchall()
-            return {row[0]: {'first_name': row[1], 'username': row[2]} for row in rows}
+        logger.info("数据库初始化完成。") 
 
     # 添加存储用户账号信息的方法
     def add_user_account(self, user_id, username, firstname, lastname, session_file, is_authenticated=0, two_factor_enabled=0):
@@ -315,57 +276,6 @@ class DatabaseManager:
         os.makedirs(user_folder, exist_ok=True)
         session_file = os.path.join(user_folder, session_filename)
         return session_file
-
-    # 申请相关的方法
-    def add_pending_application(self, user_id, first_name, username):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR IGNORE INTO pending_applications (user_id, first_name, username)
-                VALUES (?, ?, ?)
-            ''', (user_id, first_name, username))
-            conn.commit()
-
-    def get_pending_application(self, user_id):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT application_id, first_name, username, timestamp FROM pending_applications
-                WHERE user_id = ?
-            ''', (user_id,))
-            return cursor.fetchone()
-
-    def approve_application(self, user_id):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            # 获取申请信息
-            cursor.execute('''
-                SELECT first_name, username FROM pending_applications
-                WHERE user_id = ?
-            ''', (user_id,))
-            row = cursor.fetchone()
-            if not row:
-                return None
-            first_name, username = row
-            # 添加到允许用户表
-            cursor.execute('''
-                INSERT OR IGNORE INTO allowed_users (user_id, first_name, username)
-                VALUES (?, ?, ?)
-            ''', (user_id, first_name, username))
-            # 删除申请记录
-            cursor.execute('''
-                DELETE FROM pending_applications WHERE user_id = ?
-            ''', (user_id,))
-            conn.commit()
-            return first_name, username
-
-    def reject_application(self, user_id):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                DELETE FROM pending_applications WHERE user_id = ?
-            ''', (user_id,))
-            conn.commit()
 
     # 群组相关的方法
     def add_group(self, user_id, group_id, group_name):
@@ -558,7 +468,6 @@ class TelegramBot:
         self.api_id = int(api_id)
         self.api_hash = api_hash
         self.db_manager = DatabaseManager(db_path)
-        self.allowed_users = self.db_manager.get_allowed_users()
         self.parseMode = 'Markdown'
         self.application = Application.builder().token(self.token).build()
         self.user_clients = {}  # key: account_id, value: TelegramClient
@@ -606,53 +515,49 @@ class TelegramBot:
     def restricted(func):
         async def wrapped(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
             user = update.effective_user
+            if not user:
+                logger.warning("无法获取有效用户信息。")
+                await update.message.reply_text("❌ 无法识别用户信息。")
+                return
+
             user_id = user.id
-            logger.debug(f"用户 {user_id} 请求执行命令 {update.message.text}.")
-            if user_id in self.allowed_users or user_id in self.admin_ids:
-                return await func(self, update, context)
-            else:
-                # 检查是否已经有待处理的申请
-                pending = self.db_manager.get_pending_application(user_id)
-                if pending:
-                    await update.message.reply_text("ℹ️ 您的申请正在处理中，请稍候。")
-                    logger.debug(f"用户 {user_id} 已有待处理的申请。")
+            message_text = update.message.text if update.message else 'No message text'
+            logger.debug(f"用户 {user_id} 请求执行命令: {message_text}.")
+
+            # 指定群组的 chat_id（确保这是一个有效的群组 ID）
+            chat_id = -1002271927749  # 替换为你的实际群组 ID
+
+            try:
+                # 获取群组信息
+                chat = await context.bot.get_chat(chat_id)
+                # 获取用户在群组中的状态
+                member = await chat.get_member(user_id)
+
+                if member.status in ['left', 'kicked', 'restricted']:
+                    keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📢 加入群组", url='https://t.me/demonhaha_group')
+                    ]])
+                    await update.message.reply_text(
+                        "❌ 请先加入我们的群组后再申请使用机器人。",
+                        reply_markup=keyboard
+                    )
                     return
-                # 添加新的申请
-                self.db_manager.add_pending_application(user_id, user.first_name, user.username)
-                logger.info(f"用户 {user_id} 提交了访问申请。")
-                # 通知用户，包含管理员的用户名
+            except Exception as e:
+                logger.error(f"检查用户群组状态失败: {e}", exc_info=True)
+                self.application.bot.send_message(chat_id=user_id, text="❌ 发生错误，请稍后再试。")
+                return
+
+            try:
+                # 执行原始函数
+                return await func(self, update, context)
+            except Exception as e:
+                logger.error(f"执行命令时发生错误: {e}", exc_info=True)
                 await update.message.reply_text(
-                    f"📝 您需要申请使用此机器人。您的申请已提交，管理员 @{self.admin_username} 将尽快审核。"
+                    "❌ 发生错误，请稍后再试。",
+                    parse_mode='Markdown'
                 )
-                # 通知管理员
-                for admin_id in self.admin_ids:
-                    try:
-                        if user.username:
-                            user_link = f"[{user.first_name}](https://t.me/{user.username})"
-                        else:
-                            user_link = user.first_name
-                        keyboard = InlineKeyboardMarkup([
-                            [
-                                InlineKeyboardButton("✅ 同意", callback_data=f"approve:{user_id}"),
-                                InlineKeyboardButton("❌ 拒绝", callback_data=f"reject:{user_id}")
-                            ]
-                        ])
-                        # 发送申请信息给管理员
-                        await self.application.bot.send_message(
-                            chat_id=admin_id,
-                            text=(
-                                f"📋 *新用户申请使用机器人*\n\n"
-                                f"👤 *用户信息:*\n"
-                                f"姓名: {user.first_name}\n"
-                                f"用户名: @{user.username}" if user.username else "用户名: 无\n"
-                                f"用户ID: `{user_id}`"
-                            ),
-                            parse_mode='Markdown',
-                            reply_markup=keyboard
-                        )
-                        logger.debug(f"向管理员 {admin_id} 发送申请通知。")
-                    except Exception as e:
-                        logger.error(f"无法发送申请通知给管理员 {admin_id}: {e}", exc_info=True)
+                return
+
         return wrapped
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1027,51 +932,7 @@ class TelegramBot:
         data = query.data
         logger.debug(f"收到回调查询: {data}")
 
-        if data.startswith("approve:"):
-            user_id = int(data.split(":")[1])
-            result = self.db_manager.approve_application(user_id)
-            if result:
-                first_name, username = result
-                self.allowed_users[user_id] = {'first_name': first_name, 'username': username}
-                 # 添加授权用户
-                self.db_manager.add_allowed_user(user_id, first_name, username)
-                logger.info(f"用户 {user_id} ({first_name}, @{username}) 已被批准访问。")
-                # 通知用户
-                try:
-                    await self.application.bot.send_message(
-                        chat_id=user_id,
-                        text="✅ 您的申请已被批准，您现在可以使用此机器人。"
-                    )
-                    logger.debug(f"已通知用户 {user_id} 申请已批准。")
-                except Exception as e:
-                    logger.error(f"无法通知用户 {user_id} 申请已批准: {e}", exc_info=True)
-                # 更新管理员消息，包含用户信息
-                await query.edit_message_text(
-                    f"✅ 已批准用户 {first_name} (@{username}) 的访问请求。"
-                )
-            else:
-                logger.warning(f"没有找到用户 {user_id} 的申请记录。")
-                await query.edit_message_text("❌ 找不到该用户的申请记录。")
-
-        elif data.startswith("reject:"):
-            user_id = int(data.split(":")[1])
-            self.db_manager.reject_application(user_id)
-            logger.info(f"用户 {user_id} 的访问申请已被拒绝。")
-            # 通知用户
-            try:
-                await self.application.bot.send_message(
-                    chat_id=user_id,
-                    text="❌ 您的申请已被拒绝，您无法使用此机器人。"
-                )
-                logger.debug(f"已通知用户 {user_id} 申请已拒绝。")
-            except Exception as e:
-                logger.error(f"无法通知用户 {user_id} 申请已拒绝: {e}", exc_info=True)
-            # 更新管理员消息，包含用户信息
-            await query.edit_message_text(
-                f"❌ 已拒绝用户的访问请求。"
-            )
-
-        elif data.startswith("block_user:"):
+        if data.startswith("block_user:"):
             parts = data.split(":")
             if len(parts) != 3:
                 logger.warning(f"无效的 block_user 回调数据: {data}")
