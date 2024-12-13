@@ -598,6 +598,7 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("unblock", self.unblock_user))
         self.application.add_handler(CommandHandler("list_blocked_users", self.list_blocked_users))
         self.application.add_handler(CommandHandler("my_account", self.my_account))
+        self.application.add_handler(CommandHandler("my_stats", self.my_stats))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback_query))
         self.application.add_handler(MessageHandler(filters.Document.FileExtension("session") & ~filters.COMMAND, self.handle_login_step))
         logger.debug("已设置所有命令处理器。")
@@ -660,45 +661,32 @@ class TelegramBot:
         logger.debug(f"用户 {user_id} 启动了机器人。")
         welcome_text = (
             f"👋 *欢迎使用消息转发机器人！*\n\n"
-            f"此机器人允许您管理自己感兴趣的 Telegram 账号和群组，并在这些群组中有新消息时接收通知。\n\n"
-            f"*命令列表：*\n"
-            f"• `/login` - 登录您的 Telegram 账号。\n"
-            f"• `/list_accounts` - 列出您已登录的 Telegram 账号。\n"
-            f"• `/remove_account <account_id>` - 移除一个已登录的 Telegram 账号。\n"
-            f"• `/add_keyword <关键词>` - 添加关键词\n"
-            f"• `/remove_keyword <关键词>` - 删除关键词\n"
-            f"• `/list_keywords` - 列出所有关键词\n"
-            f"• `/my_stats` - 查看您的推送分析信息\n"
-            f"• `/block <用户ID>` - 屏蔽指定用户的消息。\n"
-            f"  - *示例*: `/block 123456789`\n\n"
-            f"• `/unblock <用户ID>` - 解除屏蔽指定用户的消息。\n"
-            f"  - *示例*: `/unblock 123456789`\n\n"
-            f"• `/list_blocked_users` - 查看您的屏蔽用户列表。\n\n"
-            f"• `/my_account <account_id>` - 查看指定 Telegram 账号的信息。\n\n"
-            f"• `/help` - 显示此帮助信息。\n\n"
-            f"如果您尚未获得使用权限，请使用受限命令（如 `/login`），机器人将引导您申请使用。"
+            f"此机器人可以帮助您：\n"
+            f"• 监控群组消息\n"
+            f"• 设置关键词提醒\n"
+            f"• 管理多个账号\n"
+            f"• 屏蔽指定用户\n\n"
+            f"请使用底部菜单栏的按钮来操作机器人。"
         )
         await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = (
-            f"📖 *使用说明*\n\n"
-            f"• `/login` - 登录您的 Telegram 账号。\n"
-            f"• `/list_accounts` - 列出您已登录的 Telegram 账号。\n"
-            f"• `/remove_account <account_id>` - 移除一个已登录的 Telegram 账号。\n"
-            f"• `/add_keyword <关键词>` - 添加关键词\n"
-            f"• `/remove_keyword <关键词>` - 删除关键词\n"
-            f"• `/list_keywords` - 列出所有关键词\n"
-            f"• `/my_stats` - 查看您的推送分析信息\n"
-            f"• `/block <用户ID>` - 屏蔽指定用户的消息。\n"
-            f"  - *示例*: `/block 123456789`\n\n"
-            f"• `/unblock <用户ID>` - 解除屏蔽指定用户的消息。\n"
-            f"  - *示例*: `/unblock 123456789`\n\n"
-            f"• `/list_blocked_users` - 查看您的屏蔽用户列表。\n\n"
-            f"• `/my_account <account_id>` - 查看指定 Telegram 账号的信息。\n\n"
-            f"• `/start` - 显示欢迎信息。\n"
-            f"• `/help` - 显示此帮助信息。\n\n"
-            f"如果您没有使用权限，请使用受限命令（如 `/login`），机器人将引导您申请使用。"
+            f"📖 *功能说明*\n\n"
+            f"*账号管理*\n"
+            f"• 登录账号 - 添加新的监控账号\n"
+            f"• 账号列表 - 查看已登录的账号\n\n"
+            f"*关键词管理*\n"
+            f"• 添加关键词 - 设置需要监控的关键词\n"
+            f"• 删除关键词 - 移除不需要的关键词\n"
+            f"• 关键词列表 - 查看所有关键词\n\n"
+            f"*用户管理*\n"
+            f"• 屏蔽用户 - 不再接收某用户的消息\n"
+            f"• 解除屏蔽 - 恢复接收某用户的消息\n"
+            f"• 屏蔽列表 - 查看已屏蔽的用户\n\n"
+            f"*数据统计*\n"
+            f"• 查看推送统计和关键词命中情况\n\n"
+            f"如需帮助请联系管理员 @{self.admin_username}"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -906,7 +894,7 @@ class TelegramBot:
 
             logger.debug(f"发送者链接: {sender_link}")
 
-            # 创建按钮，新增“🔒 屏蔽此用户”按钮
+            # 创建按钮，新增"🔒 屏蔽此用户"按钮
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("🔗 跳转到原消息", url=message_link),
