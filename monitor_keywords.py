@@ -325,7 +325,8 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT OR IGNORE INTO blocked_users (receiving_user_id, user_id, first_name, username)
+                INSERT OR REPLACE INTO blocked_users 
+                (receiving_user_id, user_id, first_name, username)
                 VALUES (?, ?, ?, ?)
             ''', (receiving_user_id, target_user_id, first_name, username))
             conn.commit()
@@ -517,7 +518,7 @@ class TelegramBot:
             user = update.effective_user
             if not user:
                 logger.warning("无法获取有效用户信息。")
-                await update.message.reply_text("❌ 无法识别用户信息。")
+                await update.message.reply_text("❌ 无法���别用户信息。")
                 return
 
             user_id = user.id
@@ -607,7 +608,7 @@ class TelegramBot:
         )
         logger.info(f"用户 {user_id} 启动了登录流程。")
 
-        # 初始化用户数据
+        # 初始化用户���据
         context.user_data['login_stage'] = 'awaiting_session'
     
     # 处理登录步骤
@@ -803,7 +804,7 @@ class TelegramBot:
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("🔗 跳转到原消息", url=message_link),
-                    InlineKeyboardButton("🔒 屏蔽此用户", callback_data=f"block_user:{user_id}:{uid}")
+                    InlineKeyboardButton("🔒 屏蔽此用户", callback_data=f"block_user:{user_id}:{uid}")  # 修改分隔符
                 ]
             ])
             logger.debug("创建了跳转按钮和屏蔽按钮。")
@@ -926,58 +927,113 @@ class TelegramBot:
         await update.message.reply_text(account_info, parse_mode='Markdown')
         logger.info(f"用户 {user_id} 查看了账号ID {account_id} 的信息。")
 
+    # 修改 handle_callback_query 方法
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        await query.answer()
         data = query.data
         logger.debug(f"收到回调查询: {data}")
 
-        if data.startswith("block_user:"):
-            parts = data.split(":")
-            if len(parts) != 3:
-                logger.warning(f"无效的 block_user 回调数据: {data}")
-                await query.edit_message_text("❓ 无效的操作。")
-                return
+        try:
+            if data.startswith("block_user:"):
+                # 解析用户ID
+                _, target_user_id, receiving_user_id = data.split(":")
+                target_user_id = int(target_user_id)
+                receiving_user_id = int(receiving_user_id)
+                
+                logger.debug(f"尝试屏蔽用户 - 目标用户ID: {target_user_id}, 接收用户ID: {receiving_user_id}")
 
-            target_user_id = int(parts[1])
-            receiving_user_id = int(parts[2])
+                # 检查是否已经屏蔽
+                blocked_users = self.db_manager.list_blocked_users(receiving_user_id)
+                if target_user_id in blocked_users:
+                    await query.answer("该用户已经在屏蔽列表中")
+                    await query.edit_message_text(
+                        "ℹ️ 该用户已经在您的屏蔽列表中。",
+                        parse_mode='Markdown'
+                    )
+                    return
 
-            # 获取被屏蔽用户的信息
-            try:
-                target_user = await self.application.bot.get_chat(target_user_id)
-                target_first_name = target_user.first_name
-                target_username = target_user.username
-            except Exception as e:
-                await query.edit_message_text(
-                    f"❌ 无法获取用户信息。请确保用户ID正确。\n错误详情: {e}"
-                )
-                logger.error(f"获取用户 {target_user_id} 信息失败: {e}", exc_info=True)
-                return
-
-            blocked_users = self.db_manager.list_blocked_users(receiving_user_id)
-            if target_user_id in blocked_users:
-                await query.edit_message_text("ℹ️ 该用户已经在您的屏蔽列表中。")
-                logger.info(f"用户 {receiving_user_id} 尝试屏蔽已屏蔽的用户 {target_user_id}。")
-            else:
                 try:
-                    self.db_manager.add_blocked_user(receiving_user_id, target_user_id, target_first_name, target_username)
+                    # 获取目标用户信息
+                    target_user = await context.bot.get_chat(target_user_id)
+                    target_first_name = target_user.first_name or "未知用户"
+                    target_username = target_user.username
+
+                    # 添加到屏蔽列表
+                    self.db_manager.add_blocked_user(
+                        receiving_user_id,
+                        target_user_id,
+                        target_first_name,
+                        target_username
+                    )
+
+                    # 更新消息
+                    success_message = (
+                        f"✅ 已将用户添加到屏蔽列表\n\n"
+                        f"• 用户名: {target_first_name}\n"
+                        f"• 用户ID: `{target_user_id}`"
+                    )
+                    if target_username:
+                        success_message += f"\n• Username: @{target_username}"
+
+                    await query.answer("已成功屏蔽用户")
                     await query.edit_message_text(
-                        f"✅ 已将用户 `{target_user_id}` - *{target_first_name}* @{target_username if target_username else '无'} 添加到您的屏蔽列表。",
+                        success_message,
                         parse_mode='Markdown'
                     )
-                    logger.info(f"用户 {receiving_user_id} 屏蔽了用户 {target_user_id} - {target_first_name} @{target_username if target_username else '无'}。")
+                    logger.info(f"用户 {receiving_user_id} 成功屏蔽了用户 {target_user_id}")
+
                 except Exception as e:
+                    error_message = (
+                        f"❌ 屏蔽用户失败\n\n"
+                        f"用户ID: `{target_user_id}`\n"
+                        f"错误信息: {str(e)}"
+                    )
+                    await query.answer("操作失败")
                     await query.edit_message_text(
-                        f"❌ 无法屏蔽用户。\n错误详情: {e}",
+                        error_message,
                         parse_mode='Markdown'
                     )
-                    logger.error(f"屏蔽用户 {target_user_id} 失败: {e}", exc_info=True)
+                    logger.error(f"屏蔽用户失败: {e}", exc_info=True)
 
-        else:
-            logger.warning(f"未知的回调查询数据: {data}")
-            await query.edit_message_text("❓ 未知的操作。")
+            elif data.startswith("delete:"):
+                # 处理删除关键词的逻辑
+                keyword = data.split(":", 1)[1]
+                if self.db_manager.remove_keyword(update.effective_user.id, keyword):
+                    await query.answer()
+                    await query.edit_message_text(
+                        f"✅ 关键词 '{keyword}' 已删除。",
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"用户 {update.effective_user.id} 删除了关键词 '{keyword}'")
+                else:
+                    await query.answer()
+                    await query.edit_message_text(
+                        f"⚠️ 关键词 '{keyword}' 删除失败。",
+                        parse_mode='Markdown'
+                    )
+            else:
+                logger.warning(f"未知的回调查询数据: {data}")
+                await query.answer("未知的操作")
+                await query.edit_message_text(
+                    "❓ 未知的操作类型。",
+                    parse_mode='Markdown'
+                )
 
-        
+        except ValueError as ve:
+            logger.error(f"解析回调数据失败: {ve}")
+            await query.answer("数据格式错误")
+            await query.edit_message_text(
+                "❌ 操作失败：数据格式错误",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"处理回调查询时发生错误: {e}", exc_info=True)
+            await query.answer("处理请求时出错")
+            await query.edit_message_text(
+                "❌ 操作失败，请稍后重试。",
+                parse_mode='Markdown'
+            )
+
     @restricted
     async def block_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -1176,7 +1232,7 @@ class TelegramBot:
         logger.debug("执行添加关键词命令。")
         
         if not context.args:
-            await update.message.reply_text("❌ 请提供要添加的关键词。例如：`/add Python Django Flask`", parse_mode='Markdown')
+            await update.message.reply_text("❌ 请提供要添加的关键词。例如：`/add_keyword Python Django Flask`", parse_mode='Markdown')
             logger.debug("添加关键词命令缺少参数。")
             return
         
