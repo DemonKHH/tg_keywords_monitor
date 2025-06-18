@@ -3,32 +3,21 @@ import os
 import logging
 import sqlite3
 import asyncio
+import sys
+import time
 from logging.handlers import RotatingFileHandler
 import uuid
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telethon.tl.functions.auth import SendCodeRequest, SignInRequest
-from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.tl.types import (
-    ChannelParticipantSelf,
-    ChannelParticipantCreator,
-    ChannelParticipantAdmin,
-    ChannelParticipant,
-    ChannelParticipantBanned,
-    ChannelParticipantLeft
-)
-from telethon.sessions import StringSession
-from telethon.errors import PhoneCodeExpiredError, SessionPasswordNeededError, RPCError, PhoneCodeInvalidError,PasswordHashInvalidError
+from telegram import Message, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
     CallbackQueryHandler,
-    ConversationHandler,
     MessageHandler,
     filters,
-    CallbackContext
 )
 from telegram.helpers import escape_markdown
+from telethon.sessions import StringSession
 from telethon import TelegramClient, events, errors
 from dotenv import load_dotenv
 import stat
@@ -73,16 +62,12 @@ ADMIN_IDS = os.getenv('ADMIN_IDS')  # 逗号分隔的管理员用户 ID
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'demonkinghaha')  # 默认值为 'demonkinghaha'
 API_ID = os.getenv('TELEGRAM_API_ID')
 API_HASH = os.getenv('TELEGRAM_API_HASH')
-SESSIONS_DIR = os.getenv('SESSIONS_DIR', 'sessions')
-
-# 确保会话根目录存在
-os.makedirs(SESSIONS_DIR, exist_ok=True)
 # 验证必要的环境变量
 required_env_vars = ['TELEGRAM_BOT_TOKEN', 'ADMIN_IDS', 'TELEGRAM_API_ID', 'TELEGRAM_API_HASH']
 missing_vars = [var for var in required_env_vars if not os.getenv(var)]
 if missing_vars:
     logger.critical(f"未设置以下环境变量: {', '.join(missing_vars)}")
-    exit(1)
+    sys.exit(1)
 
 # 解析管理员用户 ID
 try:
@@ -125,8 +110,7 @@ class DatabaseManager:
                     message_id INTEGER,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            ''')
-            # 创建用户 Telegram 账号表，支持多账号
+            ''')            # 创建用户 Telegram 账号表，支持多账号
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS user_accounts (
                     account_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,12 +118,42 @@ class DatabaseManager:
                     username TEXT NOT NULL UNIQUE,
                     firstname TEXT,
                     lastname TEXT,
-                    session_file TEXT NOT NULL UNIQUE,
+                    session_string TEXT NOT NULL UNIQUE,
                     is_authenticated INTEGER DEFAULT 0,
                     two_factor_enabled INTEGER DEFAULT 0,
                     FOREIGN KEY(user_id) REFERENCES allowed_users(user_id)
                 )
             ''')
+            
+            # 检查是否需要迁移旧的 session_file 列到 session_string
+            cursor.execute("PRAGMA table_info(user_accounts)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'session_file' in columns and 'session_string' not in columns:
+                # 添加新的 session_string 列
+                cursor.execute('ALTER TABLE user_accounts ADD COLUMN session_string TEXT')
+                # 删除旧的 session_file 列（SQLite 不支持直接删除列，需要重建表）
+                cursor.execute('''
+                    CREATE TABLE user_accounts_new (
+                        account_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        username TEXT NOT NULL UNIQUE,
+                        firstname TEXT,
+                        lastname TEXT,
+                        session_string TEXT,
+                        is_authenticated INTEGER DEFAULT 0,
+                        two_factor_enabled INTEGER DEFAULT 0,
+                        FOREIGN KEY(user_id) REFERENCES allowed_users(user_id)
+                    )
+                ''')
+                # 只保留已认证且session_string不为空的账号记录
+                cursor.execute('''
+                    INSERT INTO user_accounts_new 
+                    (account_id, user_id, username, firstname, lastname, session_string, is_authenticated, two_factor_enabled)
+                    SELECT account_id, user_id, username, firstname, lastname, NULL, 0, two_factor_enabled
+                    FROM user_accounts WHERE is_authenticated = 1
+                ''')
+                cursor.execute('DROP TABLE user_accounts')
+                cursor.execute('ALTER TABLE user_accounts_new RENAME TO user_accounts')
             # 创建用户群组监听表
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS user_monitored_groups (
@@ -185,17 +199,17 @@ class DatabaseManager:
         logger.info("数据库初始化完成。") 
 
     # 添加存储用户账号信息的方法
-    def add_user_account(self, user_id, username, firstname, lastname, session_file, is_authenticated=0, two_factor_enabled=0):
-        if not session_file:
-            raise ValueError("session_file 必须提供。")
+    def add_user_account(self, user_id, username, firstname, lastname, session_string, is_authenticated=0, two_factor_enabled=0):
+        if not session_string:
+            raise ValueError("session_string 必须提供。")
         
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO user_accounts 
-                (user_id, username, firstname, lastname, session_file, is_authenticated, two_factor_enabled)
+                (user_id, username, firstname, lastname, session_string, is_authenticated, two_factor_enabled)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (user_id, username, firstname, lastname, session_file, is_authenticated, two_factor_enabled))
+            ''', (user_id, username, firstname, lastname, session_string, is_authenticated, two_factor_enabled))
             account_id = cursor.lastrowid
             conn.commit()
         return account_id
@@ -204,7 +218,7 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT account_id, username, firstname, lastname, session_file, is_authenticated, two_factor_enabled
+                SELECT account_id, username, firstname, lastname, session_string, is_authenticated, two_factor_enabled
                 FROM user_accounts WHERE user_id = ?
             ''', (user_id,))
             return cursor.fetchall()
@@ -213,7 +227,7 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT user_id, username, firstname, lastname, session_file, is_authenticated, two_factor_enabled
+                SELECT user_id, username, firstname, lastname, session_string, is_authenticated, two_factor_enabled
                 FROM user_accounts WHERE account_id = ?
             ''', (account_id,))
             account = cursor.fetchone()  # 获取查询结果
@@ -233,26 +247,17 @@ class DatabaseManager:
             ''', (is_authenticated, account_id))
             conn.commit()
 
-    def set_session_file(self, account_id, session_file):
+    def set_session_string(self, account_id, session_string):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                UPDATE user_accounts SET session_file = ? WHERE account_id = ?
-            ''', (session_file, account_id))
-            conn.commit()
-
+                UPDATE user_accounts SET session_string = ? WHERE account_id = ?
+            ''', (session_string, account_id))
+            conn.commit()    
     def remove_user_account(self, account_id):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # 获取会话文件路径以便删除
-            cursor.execute('SELECT session_file FROM user_accounts WHERE account_id = ?', (account_id,))
-            row = cursor.fetchone()
-            if row:
-                session_file = row[0]
-                if os.path.exists(session_file):
-                    os.remove(session_file)
-                    logger.debug(f"已删除会话文件: {session_file}")
-            # 删除数据库记录
+            # 直接删除数据库记录，不再处理会话文件
             cursor.execute('''
                 DELETE FROM user_accounts WHERE account_id = ?
             ''', (account_id,))
@@ -262,20 +267,10 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(''' 
-                SELECT account_id, user_id, username, firstname, lastname, session_file
+                SELECT account_id, user_id, username, firstname, lastname, session_string
                 FROM user_accounts WHERE is_authenticated = 1
             ''')
             return cursor.fetchall()
-
-    # 添加方法获取会话文件路径
-    def get_session_file_path(self, user_id, session_filename):
-        """
-        获取指定用户和会话文件名的会话文件路径。
-        """
-        user_folder = os.path.join(SESSIONS_DIR, str(user_id))
-        os.makedirs(user_folder, exist_ok=True)
-        session_file = os.path.join(user_folder, session_filename)
-        return session_file
 
     # 群组相关的方法
     def add_group(self, user_id, group_id, group_name):
@@ -480,6 +475,7 @@ class TelegramBot:
             BotCommand("help", "帮助信息"),
             BotCommand("login", "登录账号"),
             BotCommand("list_accounts", "账号列表"),
+            BotCommand("remove_account", "删除账号"),
             BotCommand("add_keyword", "添加关键词"),
             BotCommand("remove_keyword", "删除关键词"),
             BotCommand("list_keywords", "关键词列表"),
@@ -518,7 +514,7 @@ class TelegramBot:
             user = update.effective_user
             if not user:
                 logger.warning("无法获取有效用户信息。")
-                await update.message.reply_text("❌ 无法���别用户信息。")
+                await update.message.reply_text("❌ 无法识别用户信息。")
                 return
 
             user_id = user.id
@@ -536,7 +532,7 @@ class TelegramBot:
 
                 if member.status in ['left', 'kicked', 'restricted']:
                     keyboard = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("📢 加入群组", url='https://t.me/demonhaha_group')
+                        InlineKeyboardButton("📢 加入群组", url='https://t.me/demon_discuss')
                     ]])
                     await update.message.reply_text(
                         "❌ 请先加入我们的群组后再申请使用机器人。",
@@ -608,7 +604,7 @@ class TelegramBot:
         )
         logger.info(f"用户 {user_id} 启动了登录流程。")
 
-        # 初始化用户���据
+        # 初始化用户数据
         context.user_data['login_stage'] = 'awaiting_session'
     
     # 处理登录步骤
@@ -619,8 +615,7 @@ class TelegramBot:
         stage = context.user_data.get('login_stage')
         if not stage:
             logger.debug(f"用户 {user_id} 没有处于登录流程中。")
-            return  # 用户不在登录流程中，无需处理
-
+            return  # 用户不在登录流程中，无需处理        
         if stage == 'awaiting_session':
             # 处理会话文件上传
             await self._handle_session_file(update, context)
@@ -632,7 +627,7 @@ class TelegramBot:
         if not update.message.document:
             await update.message.reply_text(
                 "❌ 请上传一个有效的 Telegram 会话文件（.session）。",
-                parse_mode=None  # 取消 Markdown 解析
+                parse_mode=None
             )
             logger.warning(f"用户 {user_id} 没有上传会话文件。")
             return
@@ -643,11 +638,12 @@ class TelegramBot:
         if not document.file_name.endswith('.session'):
             await update.message.reply_text(
                 "❌ 文件格式错误。请确保上传的是一个 `.session` 文件。",
-                parse_mode=None  # 取消 Markdown 解析
+                parse_mode=None
             )
             logger.warning(f"用户 {user_id} 上传了非 .session 文件：{document.file_name}")
             return
 
+        temp_session_file = None
         try:
             # 获取 File 对象
             file = await document.get_file()
@@ -655,51 +651,64 @@ class TelegramBot:
             # 下载会话文件内容
             session_bytes = await file.download_as_bytearray()
 
-            # 生成唯一的 session_file 路径
-            session_filename = f'session_{uuid.uuid4().hex}.session'
-            user_folder = os.path.join(SESSIONS_DIR, str(user_id))
-            os.makedirs(user_folder, exist_ok=True)
-            session_file = os.path.join(user_folder, session_filename)
+            # 创建临时会话文件用于验证
+            temp_session_filename = f'temp_session_{uuid.uuid4().hex}.session'
+            temp_session_file = os.path.join(os.getcwd(), temp_session_filename)
 
-            # 保存会话文件
-            with open(session_file, 'wb') as f:
-                f.write(session_bytes)
-
+            # 保存临时会话文件
+            with open(temp_session_file, 'wb') as f:
+                f.write(session_bytes)            
             # 设置文件权限（仅所有者可读写）
-            os.chmod(session_file, stat.S_IRUSR | stat.S_IWUSR)
+            os.chmod(temp_session_file, stat.S_IRUSR | stat.S_IWUSR)            # 使用临时会话文件创建客户端，只为获取 session string，无需连接
+            tmp_client = TelegramClient(temp_session_file, self.api_id, self.api_hash)
 
-            # 使用 Telethon 客户端从会话文件中获取用户信息
-            client = TelegramClient(session_file, self.api_id, self.api_hash)
+            # 获取 session string
+            session_string = StringSession.save(tmp_client.session)
+            print(session_string)
+            # 关闭临时客户端连接以释放文件句柄
+            if hasattr(tmp_client, '_connection') and tmp_client._connection:
+                await tmp_client.disconnect()
+            
+            # 安全地清理临时文件
+            if temp_session_file and os.path.exists(temp_session_file):
+                try:
+                    os.remove(temp_session_file)
+                    temp_session_file = None  # 避免在 finally 中重复删除
+                    logger.debug(f"已清理临时会话文件")
+                except PermissionError:
+                    # 在 Windows 上可能因为文件被占用而无法立即删除
+                    logger.warning(f"无法立即删除临时会话文件，将在 finally 中重试")
+                    pass
 
-            # 尝试连接客户端并进行授权检查
+            # 使用 session string 创建新的客户端并连接
+            client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
             await client.connect()
+            
+            # 如果未授权，则提示错误
+            if not await client.is_user_authorized():
+                await update.message.reply_text(
+                    "❌ 会话文件无效或未授权。请确认您的会话文件正确。",
+                    parse_mode=None
+                )
+                logger.error(f"用户 {user_id} 上传的会话文件未授权或无效。")
+                await client.disconnect()
+                return
 
             # 获取用户信息
             user = await client.get_me()
-            username = user.username or ''  # 如果没有 username，设为空字符串
+            username = user.username or ''
             firstname = user.first_name or ''
             lastname = user.last_name or ''
 
-            # 添加用户账号到数据库，获取 account_id
+            # 添加用户账号到数据库，使用 session string
             account_id = self.db_manager.add_user_account(
                 user_id=user_id,
                 username=username,
                 firstname=firstname,
                 lastname=lastname,
-                session_file=session_file,
-                is_authenticated=1  # 标记为已认证
+                session_string=session_string,
+                is_authenticated=1
             )
-
-            # 如果未授权，则提示错误
-            if not await client.is_user_authorized():
-                await update.message.reply_text(
-                    "❌ 会话文件无效或未授权。请确认您的会话文件正确。",
-                    parse_mode=None  # 取消 Markdown 解析
-                )
-                logger.error(f"用户 {user_id} 上传的会话文件未授权或无效。")
-                self.db_manager.remove_user_account(account_id)
-                os.remove(session_file)
-                return
 
             # 将客户端添加到用户客户端字典
             self.user_clients[account_id] = client
@@ -709,23 +718,42 @@ class TelegramBot:
 
             await update.message.reply_text(
                 "🎉 登录成功！您的会话已保存，您现在可以使用机器人。",
-                parse_mode=None  # 取消 Markdown 解析
+                parse_mode=None
             )
             logger.info(f"用户 {user_id} 上传了会话文件并登录成功。")
+
         except Exception as e:
-            # 确保错误消息不包含未闭合的 Markdown 实体
-            error_message = f"❌ 处理会话文件时出错：{e}".replace('_', '\\_').replace('*', '\\*').replace('`', '\\`')
+            # 使用普通文本模式避免 MarkdownV2 转义问题
+            error_message = f"❌ 处理会话文件时出错：{str(e)}"            
             await update.message.reply_text(
                 error_message,
-                parse_mode='MarkdownV2'  # 使用 MarkdownV2 并正确转义
+                parse_mode=None
             )
             logger.error(f"用户 {user_id} 处理会话文件时出错：{e}", exc_info=True)
+        
         finally:
+            # 清理临时文件（如果还存在的话）
+            if temp_session_file and os.path.exists(temp_session_file):
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        os.remove(temp_session_file)
+                        logger.debug(f"已清理临时会话文件: {temp_session_file}")
+                        break
+                    except PermissionError as e:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"删除临时文件失败 (尝试 {attempt + 1}/{max_retries})，稍后重试: {e}")
+                            # 等待一小段时间后重试
+                            time.sleep(0.1)
+                        else:
+                            logger.error(f"删除临时文件失败，已达到最大重试次数: {e}")
+                    except Exception as e:
+                        logger.error(f"删除临时文件时发生未知错误: {e}")
+                        break
             # 清理用户数据
             context.user_data.clear()
             
-    async def handle_new_message(self, event, uid):
-        # logger.debug(f"处理新消息事件")
+    async def handle_new_message(self, event: Message, uid: int):
         try:
             chat_id = event.chat_id
             # 获取发送者信息
@@ -734,16 +762,24 @@ class TelegramBot:
                 logger.debug("无法获取发送者信息，忽略。")
                 return
 
-            # 忽略来自机器人的消息
-            if sender.bot:
+            # 检查发送者类型并相应处理
+            if hasattr(sender, 'bot') and sender.bot:
                 logger.debug("忽略来自机器人发送的消息。")
                 return
 
-            user_id = sender.id
-            username = sender.username
-            first_name = sender.first_name or "未知用户"
+            # 处理频道消息
+            if hasattr(sender, 'broadcast'):  # 检查是否为频道
+                user_id = chat_id  # 对于频道消息，使用频道ID
+                username = getattr(sender, 'username', None)
+                first_name = getattr(sender, 'title', '未知频道')
+                logger.debug(f"消息来自频道: {first_name}")
+            else:
+                # 处理普通用户消息
+                user_id = sender.id
+                username = getattr(sender, 'username', None)
+                first_name = getattr(sender, 'first_name', '未知用户')
 
-            logger.debug(f"消息发送者 ID: {user_id}, 用户名: {username}, 是否为机器人: {sender.bot}")
+            logger.debug(f"消息发送者 ID: {user_id}, 用户名: {username}")
             blocked_users = self.db_manager.list_blocked_users(uid)
             # 检查用户是否被屏蔽
             if user_id in blocked_users:
@@ -757,7 +793,7 @@ class TelegramBot:
                 return  # 忽略没有文本的消息
 
             keyword_text = None
-            
+
             # 查看是否包含关键词
             keywords = self.db_manager.get_keywords(uid)
             for keyword in keywords:
@@ -769,27 +805,43 @@ class TelegramBot:
             if not keyword_text:
                 logger.debug("消息不包含关键词，忽略。")
                 return
-            
+
             # 获取消息所在的聊天
             chat = await event.get_chat()
             message_id = event.message.id
-            logger.debug(f"消息所在的聊天 ID: {chat_id}, 聊天标题: {chat.title}")
+
+            # 处理聊天标题（支持群组或私人聊天）
+            if chat:
+                if hasattr(chat, 'title') and chat.title:
+                    chat_title = chat.title
+                elif hasattr(chat, 'first_name') and chat.first_name:
+                    chat_title = f"与 {chat.first_name}"
+                else:
+                    chat_title = "私人聊天"
+            else:
+                chat_title = "无法获取群组标题"
+
+            logger.debug(f"消息所在的聊天 ID: {chat_id}, 聊天标题: {chat_title}")
 
             # 构建消息链接和群组名称
             if hasattr(chat, 'username') and chat.username:
-                chat_username = chat.username
-                message_link = f"https://t.me/{chat_username}/{message_id}"
-                group_display_name = f"[{chat.title}](https://t.me/{chat_username})"
+                # 公开群组/频道，使用普通格式链接
+                message_link = f"https://t.me/{chat.username}/{message_id}"
+                group_display_name = f"[{chat_title}](https://t.me/{chat.username})"
             else:
-                if chat_id < 0:
-                    # 群组
-                    chat_id_str = str(chat_id)[4:]
+                if chat_id < 0:  # 私有群组
+                    chat_id_str = str(chat_id)[4:]  # 去掉 -100 前缀
                     message_link = f"https://t.me/c/{chat_id_str}/{message_id}"
-                    group_display_name = f"[{chat.title}](https://t.me/c/{chat_id_str})"
-                else:
-                    # 用户对话
-                    message_link = f"https://t.me/c/{chat_id}/{message_id}"
-                    group_display_name = f"[私人聊天](https://t.me/{username})" if username else "私人聊天"
+                    # 使用消息链接作为群组名称的超链接，并标注为私有群组
+                    group_display_name = f"[{chat_title}]({message_link}) _(私有群组/频道，需为成员)_"
+                else:  # 普通用户聊天
+                    if username:
+                        message_link = f"https://t.me/{username}/{message_id}"
+                        group_display_name = f"[{chat_title}](https://t.me/{username})"
+                    else:
+                        # 如果没有用户名，使用消息链接作为群组名称的超链接
+                        message_link = f"https://t.me/c/{chat_id}/{message_id}"
+                        group_display_name = f"[{chat_title}]({message_link})"
 
             logger.debug(f"构建的消息链接: {message_link}")
             logger.debug(f"群组显示名称: {group_display_name}")
@@ -801,12 +853,10 @@ class TelegramBot:
             logger.debug(f"发送者链接: {sender_link}")
 
             # 创建按钮，新增"🔒 屏蔽此用户"按钮
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🔗 跳转到原消息", url=message_link),
-                    InlineKeyboardButton("🔒 屏蔽此用户", callback_data=f"block_user:{user_id}:{uid}")  # 修改分隔符
-                ]
-            ])
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔗 跳转到原消息", url=message_link),
+                InlineKeyboardButton("🔒 屏蔽此用户", callback_data=f"block_user:{user_id}:{uid}")
+            ]])
             logger.debug("创建了跳转按钮和屏蔽按钮。")
 
             # 构建转发消息的内容
@@ -816,6 +866,8 @@ class TelegramBot:
                 f"📝 *内容：*\n{message}"
             )
             logger.debug(f"构建的转发消息内容:\n{forward_text}")
+
+            # 尝试发送消息
             try:
                 await self.application.bot.send_message(
                     chat_id=uid,
@@ -824,61 +876,14 @@ class TelegramBot:
                     reply_markup=keyboard
                 )
                 logger.info(f"消息已成功转发给用户 {uid}。")
-                self.db_manager.record_push_log(uid, keyword_text,chat_id, message_id, datetime.now())
+                self.db_manager.record_push_log(uid, keyword_text, chat_id, message_id, datetime.now())
                 # 记录推送日志
                 logger.debug(f"已记录推送日志: 用户 {uid}, 聊天 {chat_id}, 消息 {message_id}")
             except Exception as e:
                 logger.error(f"转发消息给用户 {uid} 失败: {e}", exc_info=True)
+
         except Exception as e:
             logger.error(f"处理消息失败: {e}", exc_info=True)
-            
-    @restricted
-    async def remove_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        user_id = user.id
-
-        if len(context.args) < 1:
-            await update.message.reply_text(
-                "❌ 请提供要移除的账号ID。例如：`/remove_account 1`",
-                parse_mode='Markdown'
-            )
-            logger.debug("remove_account 命令缺少参数。")
-            return
-
-        try:
-            account_id = int(context.args[0])
-        except ValueError:
-            await update.message.reply_text(
-                "❌ 账号ID必须是整数。例如：`/remove_account 1`",
-                parse_mode='Markdown'
-            )
-            logger.debug("remove_account 命令参数不是整数。")
-            return
-
-        accounts = self.db_manager.get_user_accounts(user_id)
-        account_ids = [account[0] for account in accounts]
-        if account_id not in account_ids:
-            await update.message.reply_text(
-                "❌ 该账号ID不存在或不属于您。",
-                parse_mode='Markdown'
-            )
-            logger.warning(f"用户 {user_id} 尝试移除不存在或不属于他们的账号ID {account_id}。")
-            return
-
-        # 断开 Telethon 客户端
-        client = self.user_clients.get(account_id)
-        if client:
-            client.disconnect()
-            del self.user_clients[account_id]
-
-        # 从数据库移除账号
-        self.db_manager.remove_user_account(account_id)
-
-        await update.message.reply_text(
-            f"✅ 已移除账号ID `{account_id}`。",
-            parse_mode='Markdown'
-        )
-        logger.info(f"用户 {user_id} 移除了账号ID {account_id}。")
     @restricted
     async def my_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -1414,24 +1419,37 @@ class TelegramBot:
             # 启动所有已登录用户的 Telethon 客户端
             authenticated_accounts = self.db_manager.get_all_authenticated_accounts()
             for account in authenticated_accounts:
-                account_id, user_id, username, firstname, lastname, session_file = account
+                account_id, user_id, username, firstname, lastname, session_string = account
 
-                # 检查会话文件是否存在
-                if not os.path.exists(session_file):
-                    # 如果会话文件不存在，删除该账号的记录
+                # 检查 session_string 是否存在
+                if not session_string:
+                    # 如果 session_string 不存在，删除该账号的记录
                     self.db_manager.remove_user_account(account_id)
-                    logger.warning(f"用户 {user_id} 的会话文件 {session_file} 不存在，已删除该账号记录 (账号ID: {account_id})。")
+                    logger.warning(f"用户 {user_id} 的会话为空，已删除该账号记录 (账号ID: {account_id})。")
                     continue  # 跳过该账号，处理下一个账号
 
-                # 如果会话文件存在，启动 Telethon 客户端
-                client = TelegramClient(session_file, self.api_id, self.api_hash)
-                self.user_clients[account_id] = client
-                client.start()
+                try:
+                    
+                    # 解码 base64 编码的 session string
+                    try:
+                        client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
+                    except Exception as decode_error:
+                        logger.error(f"解码用户 {user_id} (账号ID: {account_id}) 的会话失败: {decode_error}")
+                        continue
+                    
+                    self.user_clients[account_id] = client
+                    client.start()
 
-                # 注册消息事件处理器
-                client.add_event_handler(lambda event, uid=user_id: self.handle_new_message(event, uid), events.NewMessage)
+                    # 注册消息事件处理器
+                    client.add_event_handler(lambda event, uid=user_id: self.handle_new_message(event, uid), events.NewMessage)
 
-                logger.info(f"已启动并连接用户 {user_id} 用户名： @{username} 全名： {firstname} {lastname} 的 Telethon 客户端 (账号ID: {account_id})。")
+                    logger.info(f"已启动并连接用户 {user_id} 用户名： @{username} 全名： {firstname} {lastname} 的 Telethon 客户端 (账号ID: {account_id})。")
+                except Exception as e:
+                    # 捕获并记录单个客户端的启动错误，但不影响其他客户端和整个程序
+                    logger.error(f"启动用户 {user_id} (账号ID: {account_id}) 的 Telethon 客户端失败: {e}", exc_info=True)
+                    # 如果已经创建了客户端对象，从字典中移除
+                    if account_id in self.user_clients:
+                        del self.user_clients[account_id]
 
             # 启动机器人
             self.application.run_polling()
@@ -1443,7 +1461,10 @@ class TelegramBot:
         finally:
             # 断开所有 Telethon 客户端连接
             for client in self.user_clients.values():
-                client.disconnect()
+                try:
+                    client.disconnect()
+                except Exception as e:
+                    logger.error(f"断开客户端连接时发生错误: {e}", exc_info=True)
             logger.info("所有 Telethon 客户端已断开连接。")
 
 # 启动脚本
